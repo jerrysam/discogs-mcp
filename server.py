@@ -21,6 +21,11 @@ DISCOGS_TOKEN = os.environ.get("DISCOGS_TOKEN")
 BASE_URL = "https://api.discogs.com"
 USER_AGENT = "DiscogsMCP/1.0"
 
+def _get_headers():
+    return {"User-Agent": USER_AGENT} | (
+        {"Authorization": f"Discogs token={DISCOGS_TOKEN}"} if DISCOGS_TOKEN else {}
+    )
+
 
 @mcp.tool()
 async def search_records(
@@ -44,55 +49,28 @@ async def search_records(
         year: Filter by release year
         format: Filter by format (e.g., Vinyl, CD, Cassette)
     """
-    params = {"q": query, "per_page": min(n, 100)}
-    if type:
-        params["type"] = type
-    if artist:
-        params["artist"] = artist
-    if genre:
-        params["genre"] = genre
-    if year:
-        params["year"] = year
-    if format:
-        params["format"] = format
-
-    headers = {"User-Agent": USER_AGENT}
-    if DISCOGS_TOKEN:
-        headers["Authorization"] = f"Discogs token={DISCOGS_TOKEN}"
+    params = {k: v for k, v in {
+        "q": query, "per_page": min(n, 100), "type": type,
+        "artist": artist, "genre": genre, "year": year, "format": format
+    }.items() if v is not None}
 
     async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            f"{BASE_URL}/database/search",
-            params=params,
-            headers=headers,
-        )
+        resp = await client.get(f"{BASE_URL}/database/search", params=params, headers=_get_headers())
         resp.raise_for_status()
-        data = resp.json()
+        items = resp.json().get("results", [])[:n]
 
-        items = data.get("results", [])[:n]
-
-    results = []
-    for item in items:
-        # Extract release ID from URI
-        release_id = None
-        uri = item.get("uri", "")
-        match = re.search(r"/release/(\d+)", uri)
-        if match:
-            release_id = int(match.group(1))
-
-        results.append({
-            "release_id": release_id,
-            "title": item.get("title"),
-            "year": item.get("year"),
-            "format": item.get("format"),
-            "label": item.get("label"),
-            "genre": item.get("genre"),
-            "style": item.get("style"),
-            "country": item.get("country"),
-            "url": f"https://www.discogs.com{item.get('uri', '')}",
-            "thumb": item.get("thumb"),
-        })
-    return results
+    return [{
+        "release_id": int(m.group(1)) if (m := re.search(r"/release/(\d+)", item.get("uri", ""))) else None,
+        "title": item.get("title"),
+        "year": item.get("year"),
+        "format": item.get("format"),
+        "label": item.get("label"),
+        "genre": item.get("genre"),
+        "style": item.get("style"),
+        "country": item.get("country"),
+        "url": f"https://www.discogs.com{item.get('uri', '')}",
+        "thumb": item.get("thumb"),
+    } for item in items]
 
 
 @mcp.tool()
@@ -103,22 +81,16 @@ async def get_release(release_id: int) -> dict:
     Args:
         release_id: The Discogs release ID
     """
-    headers = {"User-Agent": USER_AGENT}
-    if DISCOGS_TOKEN:
-        headers["Authorization"] = f"Discogs token={DISCOGS_TOKEN}"
-
     async with httpx.AsyncClient() as client:
-        # Fetch release details and marketplace stats in parallel
         release_resp, stats_resp = await asyncio.gather(
-            client.get(f"{BASE_URL}/releases/{release_id}", headers=headers),
-            client.get(f"{BASE_URL}/marketplace/stats/{release_id}", headers=headers),
+            client.get(f"{BASE_URL}/releases/{release_id}", headers=_get_headers()),
+            client.get(f"{BASE_URL}/marketplace/stats/{release_id}", headers=_get_headers()),
             return_exceptions=True
         )
-
         release_resp.raise_for_status()
         data = release_resp.json()
 
-        # Get pricing data if available
+        # Extract pricing if available
         pricing = {"lowest_price": None, "median_price": None, "highest_price": None}
         if not isinstance(stats_resp, Exception):
             try:
@@ -132,6 +104,9 @@ async def get_release(release_id: int) -> dict:
             except Exception:
                 pass
 
+    community = data.get("community", {})
+    rating = community.get("rating", {})
+
     return {
         "title": data.get("title"),
         "artists": [a.get("name") for a in data.get("artists", [])],
@@ -143,10 +118,10 @@ async def get_release(release_id: int) -> dict:
         "country": data.get("country"),
         "tracklist": [{"position": t.get("position"), "title": t.get("title"), "duration": t.get("duration")} for t in data.get("tracklist", [])],
         "community": {
-            "want": data.get("community", {}).get("want"),
-            "have": data.get("community", {}).get("have"),
-            "rating": data.get("community", {}).get("rating", {}).get("average"),
-            "ratings_count": data.get("community", {}).get("rating", {}).get("count"),
+            "want": community.get("want"),
+            "have": community.get("have"),
+            "rating": rating.get("average"),
+            "ratings_count": rating.get("count"),
         },
         "pricing": pricing,
         "url": data.get("uri"),
