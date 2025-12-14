@@ -22,44 +22,6 @@ BASE_URL = "https://api.discogs.com"
 USER_AGENT = "DiscogsMCP/1.0"
 
 
-async def _fetch_release_stats(client: httpx.AsyncClient, headers: dict, release_id: int) -> dict:
-    """Fetch community stats and pricing for a single release."""
-    try:
-        # Fetch both release details and marketplace stats in parallel
-        release_resp, stats_resp = await asyncio.gather(
-            client.get(f"{BASE_URL}/releases/{release_id}", headers=headers),
-            client.get(f"{BASE_URL}/marketplace/stats/{release_id}", headers=headers),
-            return_exceptions=True
-        )
-
-        result = {"want": None, "have": None, "rating": None, "lowest_price": None, "median_price": None, "highest_price": None}
-
-        # Process release data
-        if not isinstance(release_resp, Exception):
-            release_resp.raise_for_status()
-            data = release_resp.json()
-            community = data.get("community", {})
-            result.update({
-                "want": community.get("want"),
-                "have": community.get("have"),
-                "rating": community.get("rating", {}).get("average"),
-            })
-
-        # Process marketplace stats
-        if not isinstance(stats_resp, Exception):
-            stats_resp.raise_for_status()
-            stats_data = stats_resp.json()
-            result.update({
-                "lowest_price": stats_data.get("lowest_price", {}).get("value"),
-                "median_price": stats_data.get("median", {}).get("value"),
-                "highest_price": stats_data.get("highest_price", {}).get("value"),
-            })
-
-        return result
-    except Exception:
-        return {"want": None, "have": None, "rating": None, "lowest_price": None, "median_price": None, "highest_price": None}
-
-
 @mcp.tool()
 async def search_records(
     query: str,
@@ -71,7 +33,7 @@ async def search_records(
     format: str | None = None,
 ) -> list[dict]:
     """
-    Search Discogs for records. Returns results with community stats (wants/haves/rating) and marketplace pricing.
+    Search Discogs for records. Returns basic search results. Use get_release() for detailed info.
 
     Args:
         query: Search query string
@@ -109,29 +71,17 @@ async def search_records(
 
         items = data.get("results", [])[:n]
 
-        # Extract release IDs and fetch stats in parallel
-        release_ids = []
-        for item in items:
-            uri = item.get("uri", "")
-            match = re.search(r"/release/(\d+)", uri)
-            if match:
-                release_ids.append(int(match.group(1)))
-            else:
-                release_ids.append(None)
-
-        # Fetch community stats and pricing for releases in parallel
-        stats_tasks = []
-        for rid in release_ids:
-            if rid:
-                stats_tasks.append(_fetch_release_stats(client, headers, rid))
-            else:
-                stats_tasks.append(asyncio.coroutine(lambda: {"want": None, "have": None, "rating": None, "lowest_price": None, "median_price": None, "highest_price": None})())
-
-        stats_list = await asyncio.gather(*stats_tasks)
-
     results = []
-    for item, stats in zip(items, stats_list):
+    for item in items:
+        # Extract release ID from URI
+        release_id = None
+        uri = item.get("uri", "")
+        match = re.search(r"/release/(\d+)", uri)
+        if match:
+            release_id = int(match.group(1))
+
         results.append({
+            "release_id": release_id,
             "title": item.get("title"),
             "year": item.get("year"),
             "format": item.get("format"),
@@ -141,12 +91,6 @@ async def search_records(
             "country": item.get("country"),
             "url": f"https://www.discogs.com{item.get('uri', '')}",
             "thumb": item.get("thumb"),
-            "want": stats.get("want"),
-            "have": stats.get("have"),
-            "rating": stats.get("rating"),
-            "lowest_price": stats.get("lowest_price"),
-            "median_price": stats.get("median_price"),
-            "highest_price": stats.get("highest_price"),
         })
     return results
 
