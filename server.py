@@ -23,19 +23,41 @@ USER_AGENT = "DiscogsMCP/1.0"
 
 
 async def _fetch_release_stats(client: httpx.AsyncClient, headers: dict, release_id: int) -> dict:
-    """Fetch community stats for a single release."""
+    """Fetch community stats and pricing for a single release."""
     try:
-        resp = await client.get(f"{BASE_URL}/releases/{release_id}", headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
-        community = data.get("community", {})
-        return {
-            "want": community.get("want"),
-            "have": community.get("have"),
-            "rating": community.get("rating", {}).get("average"),
-        }
+        # Fetch both release details and marketplace stats in parallel
+        release_resp, stats_resp = await asyncio.gather(
+            client.get(f"{BASE_URL}/releases/{release_id}", headers=headers),
+            client.get(f"{BASE_URL}/marketplace/stats/{release_id}", headers=headers),
+            return_exceptions=True
+        )
+
+        result = {"want": None, "have": None, "rating": None, "lowest_price": None, "median_price": None, "highest_price": None}
+
+        # Process release data
+        if not isinstance(release_resp, Exception):
+            release_resp.raise_for_status()
+            data = release_resp.json()
+            community = data.get("community", {})
+            result.update({
+                "want": community.get("want"),
+                "have": community.get("have"),
+                "rating": community.get("rating", {}).get("average"),
+            })
+
+        # Process marketplace stats
+        if not isinstance(stats_resp, Exception):
+            stats_resp.raise_for_status()
+            stats_data = stats_resp.json()
+            result.update({
+                "lowest_price": stats_data.get("lowest_price", {}).get("value"),
+                "median_price": stats_data.get("median", {}).get("value"),
+                "highest_price": stats_data.get("highest_price", {}).get("value"),
+            })
+
+        return result
     except Exception:
-        return {"want": None, "have": None, "rating": None}
+        return {"want": None, "have": None, "rating": None, "lowest_price": None, "median_price": None, "highest_price": None}
 
 
 @mcp.tool()
@@ -49,7 +71,7 @@ async def search_records(
     format: str | None = None,
 ) -> list[dict]:
     """
-    Search Discogs for records. Returns results with community stats (wants/haves/rating).
+    Search Discogs for records. Returns results with community stats (wants/haves/rating) and marketplace pricing.
 
     Args:
         query: Search query string
@@ -97,13 +119,13 @@ async def search_records(
             else:
                 release_ids.append(None)
 
-        # Fetch community stats for releases in parallel
+        # Fetch community stats and pricing for releases in parallel
         stats_tasks = []
         for rid in release_ids:
             if rid:
                 stats_tasks.append(_fetch_release_stats(client, headers, rid))
             else:
-                stats_tasks.append(asyncio.coroutine(lambda: {"want": None, "have": None, "rating": None})())
+                stats_tasks.append(asyncio.coroutine(lambda: {"want": None, "have": None, "rating": None, "lowest_price": None, "median_price": None, "highest_price": None})())
 
         stats_list = await asyncio.gather(*stats_tasks)
 
@@ -122,6 +144,9 @@ async def search_records(
             "want": stats.get("want"),
             "have": stats.get("have"),
             "rating": stats.get("rating"),
+            "lowest_price": stats.get("lowest_price"),
+            "median_price": stats.get("median_price"),
+            "highest_price": stats.get("highest_price"),
         })
     return results
 
@@ -129,7 +154,7 @@ async def search_records(
 @mcp.tool()
 async def get_release(release_id: int) -> dict:
     """
-    Get detailed info about a specific release, including community stats (wants/haves).
+    Get detailed info about a specific release, including community stats and pricing.
 
     Args:
         release_id: The Discogs release ID
@@ -139,9 +164,29 @@ async def get_release(release_id: int) -> dict:
         headers["Authorization"] = f"Discogs token={DISCOGS_TOKEN}"
 
     async with httpx.AsyncClient() as client:
-        resp = await client.get(f"{BASE_URL}/releases/{release_id}", headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
+        # Fetch release details and marketplace stats in parallel
+        release_resp, stats_resp = await asyncio.gather(
+            client.get(f"{BASE_URL}/releases/{release_id}", headers=headers),
+            client.get(f"{BASE_URL}/marketplace/stats/{release_id}", headers=headers),
+            return_exceptions=True
+        )
+
+        release_resp.raise_for_status()
+        data = release_resp.json()
+
+        # Get pricing data if available
+        pricing = {"lowest_price": None, "median_price": None, "highest_price": None}
+        if not isinstance(stats_resp, Exception):
+            try:
+                stats_resp.raise_for_status()
+                stats_data = stats_resp.json()
+                pricing = {
+                    "lowest_price": stats_data.get("lowest_price", {}).get("value"),
+                    "median_price": stats_data.get("median", {}).get("value"),
+                    "highest_price": stats_data.get("highest_price", {}).get("value"),
+                }
+            except Exception:
+                pass
 
     return {
         "title": data.get("title"),
@@ -159,6 +204,7 @@ async def get_release(release_id: int) -> dict:
             "rating": data.get("community", {}).get("rating", {}).get("average"),
             "ratings_count": data.get("community", {}).get("rating", {}).get("count"),
         },
+        "pricing": pricing,
         "url": data.get("uri"),
     }
 
