@@ -6,6 +6,7 @@ load_dotenv()
 import asyncio
 import re
 import httpx
+from aiolimiter import AsyncLimiter
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
@@ -20,6 +21,10 @@ mcp = FastMCP("discogs", transport_security=transport_security)
 DISCOGS_TOKEN = os.environ.get("DISCOGS_TOKEN")
 BASE_URL = "https://api.discogs.com"
 USER_AGENT = "DiscogsMCP/1.0"
+
+# Rate limiter for Discogs API (60 requests per minute)
+# Using aiolimiter's leaky bucket algorithm for accurate rate limiting
+rate_limiter = AsyncLimiter(max_rate=60, time_period=60)
 
 def _get_headers():
     return {"User-Agent": USER_AGENT} | (
@@ -55,9 +60,10 @@ async def search_records(
     }.items() if v is not None}
 
     async with httpx.AsyncClient() as client:
-        resp = await client.get(f"{BASE_URL}/database/search", params=params, headers=_get_headers())
-        resp.raise_for_status()
-        items = resp.json().get("results", [])[:n]
+        async with rate_limiter:
+            resp = await client.get(f"{BASE_URL}/database/search", params=params, headers=_get_headers())
+            resp.raise_for_status()
+            items = resp.json().get("results", [])[:n]
 
     return [{
         "release_id": int(m.group(1)) if (m := re.search(r"/release/(\d+)", item.get("uri", ""))) else None,
@@ -82,11 +88,14 @@ async def get_release(release_id: int) -> dict:
         release_id: The Discogs release ID
     """
     async with httpx.AsyncClient() as client:
-        release_resp, stats_resp = await asyncio.gather(
-            client.get(f"{BASE_URL}/releases/{release_id}", headers=_get_headers()),
-            client.get(f"{BASE_URL}/marketplace/stats/{release_id}", headers=_get_headers()),
-            return_exceptions=True
-        )
+        # Acquire rate limit tokens for both requests
+        async with rate_limiter:
+            async with rate_limiter:
+                release_resp, stats_resp = await asyncio.gather(
+                    client.get(f"{BASE_URL}/releases/{release_id}", headers=_get_headers()),
+                    client.get(f"{BASE_URL}/marketplace/stats/{release_id}", headers=_get_headers()),
+                    return_exceptions=True
+                )
         release_resp.raise_for_status()
         data = release_resp.json()
 
